@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--services",
         nargs="+",
         default=None,
-        help="Specific services to scan (e.g. S3 IAM EC2 RDS CloudTrail EBS Lambda). Default: all.",
+        help="Specific services to scan (e.g. S3 IAM EC2 RDS CloudTrail EBS Lambda ECS ECR ECSFargate). Default: all.",
     )
     parser.add_argument(
         "--regions",

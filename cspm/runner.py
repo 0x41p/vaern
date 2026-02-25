@@ -12,6 +12,9 @@ import cspm.scanners.rds  # noqa: F401
 import cspm.scanners.cloudtrail  # noqa: F401
 import cspm.scanners.ebs  # noqa: F401
 import cspm.scanners.lambda_  # noqa: F401
+import cspm.scanners.ecs  # noqa: F401
+import cspm.scanners.ecr  # noqa: F401
+import cspm.scanners.ecs_fargate  # noqa: F401
 
 GLOBAL_SERVICES = {"IAM"}
 

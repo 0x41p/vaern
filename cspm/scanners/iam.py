@@ -1,7 +1,8 @@
 import csv
 import io
+import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from botocore.exceptions import ClientError
 
@@ -216,10 +217,16 @@ class IAMScanner(BaseScanner):
     def _check_password_rotation(self, cred_report: list[dict]) -> list[Finding]:
         findings = []
         now = datetime.now(timezone.utc)
+        # The credential report is cached by AWS for up to 4 hours.
+        # Cross-reference with CloudTrail to catch recent password changes
+        # that the stale report may have missed.
+        recent_changes = self._get_recent_password_changes()
         for row in cred_report:
             if row["user"] == "<root_account>":
                 continue
             if row.get("password_enabled", "false").lower() != "true":
+                continue
+            if row["user"] in recent_changes:
                 continue
             last_changed = row.get("password_last_changed", "N/A")
             if last_changed == "N/A" or last_changed == "not_supported":
@@ -243,3 +250,39 @@ class IAMScanner(BaseScanner):
             except (ValueError, TypeError):
                 pass
         return findings
+
+    def _get_recent_password_changes(self) -> set[str]:
+        """Query CloudTrail for password changes in the last 4 hours.
+
+        The IAM credential report is cached by AWS for up to 4 hours, so
+        recent password rotations may not appear in it. This method fills
+        that gap by checking CloudTrail for ChangePassword and
+        UpdateLoginProfile events.
+        """
+        changed: set[str] = set()
+        try:
+            ct = self._get_client("cloudtrail")
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+            for event_name in ("ChangePassword", "UpdateLoginProfile"):
+                resp = ct.lookup_events(
+                    LookupAttributes=[{
+                        "AttributeKey": "EventName",
+                        "AttributeValue": event_name,
+                    }],
+                    StartTime=cutoff,
+                    MaxResults=50,
+                )
+                for event in resp.get("Events", []):
+                    ct_event = json.loads(event.get("CloudTrailEvent", "{}"))
+                    # UpdateLoginProfile targets a specific user
+                    target = (
+                        ct_event.get("requestParameters", {}).get("userName")
+                    )
+                    # ChangePassword is self-service — the caller is the user
+                    if not target:
+                        target = event.get("Username")
+                    if target:
+                        changed.add(target)
+        except Exception:
+            pass
+        return changed

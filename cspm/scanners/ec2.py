@@ -1,9 +1,30 @@
+import logging
+
 from botocore.exceptions import ClientError
 
 from cspm.models import Finding, Severity
 from cspm.scanners import BaseScanner, register_scanner
 
+logger = logging.getLogger(__name__)
+
 OPEN_CIDRS = {"0.0.0.0/0", "::/0"}
+
+INSPECTOR_SEVERITY_MAP = {
+    "CRITICAL": Severity.CRITICAL,
+    "HIGH": Severity.HIGH,
+    "MEDIUM": Severity.MEDIUM,
+    "LOW": Severity.LOW,
+    "INFORMATIONAL": Severity.LOW,
+    "UNTRIAGED": Severity.MEDIUM,
+}
+
+# When a CVE is both exploitable and internet-reachable, escalate one tier
+SEVERITY_ESCALATION = {
+    Severity.LOW: Severity.MEDIUM,
+    Severity.MEDIUM: Severity.HIGH,
+    Severity.HIGH: Severity.CRITICAL,
+    Severity.CRITICAL: Severity.CRITICAL,
+}
 
 
 @register_scanner
@@ -38,6 +59,13 @@ class EC2Scanner(BaseScanner):
 
         findings.extend(self._check_public_ip_wide_open_sg(ec2, instances, wide_open_sg_ids))
         findings.extend(self._check_vpc_flow_logs(ec2, vpcs))
+
+        # Vulnerability scanning — reuse already-fetched SG and instance data
+        sg_exposure = self._build_sg_exposure_map(security_groups)
+        instance_network = self._build_instance_network_map(instances)
+        ip_to_instance = self._build_ip_to_instance_map(instances)
+        lb_instance_map = self._build_lb_instance_map(ip_to_instance)
+        findings.extend(self._scan_ec2_vulnerabilities(sg_exposure, instance_network, lb_instance_map))
 
         return findings
 
@@ -249,6 +277,336 @@ class EC2Scanner(BaseScanner):
                 ),
             ))
         return findings
+
+    # ------------------------------------------------------------------ #
+    # Reachability map builders (use already-fetched data, no extra calls)
+    # ------------------------------------------------------------------ #
+
+    def _build_sg_exposure_map(
+        self, security_groups: list[dict]
+    ) -> dict[str, list[str]]:
+        """Map SG ID → list of internet-exposed port descriptions.
+
+        Only SGs with at least one inbound rule open to 0.0.0.0/0 or ::/0
+        are included. Port descriptions look like "TCP 22", "UDP 53-54",
+        or "all ports".
+        """
+        exposure: dict[str, list[str]] = {}
+        for sg in security_groups:
+            sg_id = sg["GroupId"]
+            exposed_ports: list[str] = []
+            for rule in sg.get("IpPermissions", []):
+                open_cidrs = {r.get("CidrIp") for r in rule.get("IpRanges", [])}
+                open_cidrs |= {r.get("CidrIpv6") for r in rule.get("Ipv6Ranges", [])}
+                if not (OPEN_CIDRS & open_cidrs):
+                    continue
+                protocol = str(rule.get("IpProtocol", ""))
+                if protocol == "-1":
+                    exposed_ports.append("all ports")
+                    break
+                from_port = rule.get("FromPort", 0)
+                to_port = rule.get("ToPort", 65535)
+                if protocol in ("tcp", "6"):
+                    label = "TCP"
+                elif protocol in ("udp", "17"):
+                    label = "UDP"
+                else:
+                    label = protocol.upper()
+                if from_port == to_port:
+                    exposed_ports.append(f"{label} {from_port}")
+                else:
+                    exposed_ports.append(f"{label} {from_port}-{to_port}")
+            if exposed_ports:
+                exposure[sg_id] = exposed_ports
+        return exposure
+
+    def _build_instance_network_map(
+        self, instances: list[dict]
+    ) -> dict[str, dict]:
+        """Map instance ID → {sg_ids, public_ip}."""
+        network: dict[str, dict] = {}
+        for instance in instances:
+            network[instance["InstanceId"]] = {
+                "sg_ids": {g["GroupId"] for g in instance.get("SecurityGroups", [])},
+                "public_ip": instance.get("PublicIpAddress"),
+            }
+        return network
+
+    def _build_ip_to_instance_map(self, instances: list[dict]) -> dict[str, str]:
+        """Map every private IP address → instance ID.
+
+        Covers primary and secondary IPs across all ENIs attached to each
+        instance. Used to resolve IP-mode LB targets back to an instance ID.
+        Fargate task ENIs have no EC2 instance backing them so they simply
+        won't appear here — correct behaviour for an EC2 scanner.
+        """
+        ip_map: dict[str, str] = {}
+        for instance in instances:
+            iid = instance["InstanceId"]
+            for nic in instance.get("NetworkInterfaces", []):
+                for addr in nic.get("PrivateIpAddresses", []):
+                    ip = addr.get("PrivateIpAddress")
+                    if ip:
+                        ip_map[ip] = iid
+        return ip_map
+
+    def _build_lb_instance_map(self, ip_to_instance: dict[str, str]) -> dict[str, list[str]]:
+        """Map instance ID → list of internet-facing LB DNS names that target it.
+
+        Covers both ELBv2 (ALB/NLB) and Classic ELB. Only instance-mode
+        target groups are walked; IP-mode targets are skipped. Failures are
+        silently swallowed so a missing permission never blocks the main scan.
+        """
+        # Use a set per instance to avoid duplicates when an instance appears
+        # in multiple target groups of the same LB.
+        result: dict[str, set[str]] = {}
+
+        # ── ELBv2 (ALB / NLB) ────────────────────────────────────────────
+        try:
+            elbv2 = self._get_client("elbv2")
+            lb_paginator = elbv2.get_paginator("describe_load_balancers")
+            for page in lb_paginator.paginate():
+                for lb in page.get("LoadBalancers", []):
+                    if lb.get("Scheme") != "internet-facing":
+                        continue
+                    lb_dns = lb["DNSName"]
+                    lb_arn = lb["LoadBalancerArn"]
+                    try:
+                        tg_resp = elbv2.describe_target_groups(LoadBalancerArn=lb_arn)
+                        for tg in tg_resp.get("TargetGroups", []):
+                            target_type = tg.get("TargetType")
+                            if target_type not in ("instance", "ip"):
+                                continue  # lambda targets have no EC2 instance
+                            tg_arn = tg["TargetGroupArn"]
+                            try:
+                                health = elbv2.describe_target_health(TargetGroupArn=tg_arn)
+                                for thd in health.get("TargetHealthDescriptions", []):
+                                    state = thd.get("TargetHealth", {}).get("State", "")
+                                    if state not in ("healthy", "initial", "draining"):
+                                        continue
+                                    target_id = thd["Target"]["Id"]
+                                    if target_type == "instance":
+                                        result.setdefault(target_id, set()).add(lb_dns)
+                                    else:
+                                        # IP mode: resolve private IP → instance ID.
+                                        # Fargate task IPs won't be in the map — skipped.
+                                        iid = ip_to_instance.get(target_id)
+                                        if iid:
+                                            result.setdefault(iid, set()).add(lb_dns)
+                            except ClientError:
+                                pass
+                    except ClientError:
+                        pass
+        except ClientError as e:
+            logger.warning("ELBv2 lookup for reachability failed: %s", e)
+
+        # ── Classic ELB ───────────────────────────────────────────────────
+        try:
+            elb = self._get_client("elb")
+            clb_paginator = elb.get_paginator("describe_load_balancers")
+            for page in clb_paginator.paginate():
+                for lb in page.get("LoadBalancerDescriptions", []):
+                    if lb.get("Scheme") != "internet-facing":
+                        continue
+                    lb_dns = lb["DNSName"]
+                    for inst in lb.get("Instances", []):
+                        iid = inst["InstanceId"]
+                        result.setdefault(iid, set()).add(lb_dns)
+        except ClientError as e:
+            logger.warning("Classic ELB lookup for reachability failed: %s", e)
+
+        return {iid: sorted(dns_set) for iid, dns_set in result.items()}
+
+    def _instance_reachability(
+        self,
+        instance_id: str,
+        instance_network: dict[str, dict],
+        sg_exposure: dict[str, list[str]],
+        lb_instance_map: dict[str, list[str]],
+    ) -> tuple[bool, list[str], list[str]]:
+        """Return (is_internet_reachable, direct_ports, via_lb_dns_names).
+
+        direct_ports   – ports open to 0.0.0.0/0/::/0 on the instance's own SGs
+                         (only populated when the instance also has a public IP).
+        via_lb_dns_names – DNS names of internet-facing LBs that target this instance
+                           (populated even when the instance has no public IP).
+        """
+        direct_ports: list[str] = []
+        via_lbs: list[str] = lb_instance_map.get(instance_id, [])
+
+        net = instance_network.get(instance_id)
+        if net and net["public_ip"]:
+            exposed: list[str] = []
+            for sg_id in net["sg_ids"]:
+                exposed.extend(sg_exposure.get(sg_id, []))
+            seen: set[str] = set()
+            direct_ports = [p for p in exposed if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
+
+        is_reachable = bool(direct_ports or via_lbs)
+        return is_reachable, direct_ports, via_lbs
+
+    # ------------------------------------------------------------------ #
+    # EC2 vulnerability scanning via Inspector v2
+    # ------------------------------------------------------------------ #
+
+    def _scan_ec2_vulnerabilities(
+        self,
+        sg_exposure: dict[str, list[str]],
+        instance_network: dict[str, dict],
+        lb_instance_map: dict[str, list[str]],
+    ) -> list[Finding]:
+        """Query Inspector v2 for EC2 package CVEs, enriched with reachability."""
+        try:
+            inspector = self._get_client("inspector2")
+            findings: list[Finding] = []
+            paginator = inspector.get_paginator("list_findings")
+            filter_criteria = {
+                "resourceType": [{"comparison": "EQUALS", "value": "AWS_EC2_INSTANCE"}],
+                "findingType": [{"comparison": "EQUALS", "value": "PACKAGE_VULNERABILITY"}],
+                "findingStatus": [{"comparison": "EQUALS", "value": "ACTIVE"}],
+            }
+            for page in paginator.paginate(filterCriteria=filter_criteria):
+                for f in page.get("findings", []):
+                    finding = self._parse_ec2_inspector_finding(
+                        f, sg_exposure, instance_network, lb_instance_map
+                    )
+                    if finding:
+                        findings.append(finding)
+            return findings
+        except ClientError as e:
+            if e.response["Error"]["Code"] in (
+                "AccessDeniedException", "ValidationException"
+            ):
+                logger.warning(
+                    "Inspector v2 unavailable; EC2 vulnerability scanning skipped."
+                )
+                return []
+            raise
+
+    def _parse_ec2_inspector_finding(
+        self,
+        f: dict,
+        sg_exposure: dict[str, list[str]],
+        instance_network: dict[str, dict],
+        lb_instance_map: dict[str, list[str]],
+    ) -> Finding | None:
+        vuln = f.get("packageVulnerabilityDetails", {})
+        cve_id = vuln.get("vulnerabilityId", "")
+        if not cve_id:
+            return None
+
+        severity = INSPECTOR_SEVERITY_MAP.get(f.get("severity", "MEDIUM"), Severity.MEDIUM)
+
+        cvss_score = None
+        if f.get("inspectorScore") is not None:
+            cvss_score = float(f["inspectorScore"])
+        elif vuln.get("cvss"):
+            for entry in vuln["cvss"]:
+                if "baseScore" in entry:
+                    cvss_score = float(entry["baseScore"])
+                    break
+
+        epss_score = None
+        if f.get("epss") and "score" in f["epss"]:
+            epss_score = float(f["epss"]["score"])
+
+        exploit_available = None
+        if f.get("exploitAvailable") is not None:
+            exploit_available = f["exploitAvailable"] == "YES"
+
+        fix_available = None
+        if f.get("fixAvailable") is not None:
+            fix_available = f["fixAvailable"] == "YES"
+
+        package_name = package_version = fixed_in_version = None
+        if vuln.get("vulnerablePackages"):
+            pkg = vuln["vulnerablePackages"][0]
+            package_name = pkg.get("name")
+            package_version = pkg.get("version")
+            fixed_in_version = pkg.get("fixedInVersion")
+
+        resources = f.get("resources", [])
+        resource_arn = resources[0]["id"] if resources else "unknown"
+        # ARN format: arn:aws:ec2:<region>:<account>:instance/i-xxxx
+        instance_id = resource_arn.rsplit("/", 1)[-1]
+
+        is_reachable, direct_ports, via_lbs = self._instance_reachability(
+            instance_id, instance_network, sg_exposure, lb_instance_map
+        )
+
+        # Escalate severity when exploit exists AND instance is reachable from internet
+        if is_reachable and exploit_available:
+            severity = SEVERITY_ESCALATION.get(severity, severity)
+
+        # Description
+        description = f"{cve_id} found on EC2 instance {instance_id}"
+        if package_name:
+            description += f" (package: {package_name}"
+            if package_version:
+                description += f" {package_version}"
+            description += ")"
+        if direct_ports:
+            description += (
+                f". INTERNET REACHABLE (direct): public IP with inbound rules"
+                f" open to 0.0.0.0/0/::/0 on {', '.join(direct_ports)}"
+            )
+        if via_lbs:
+            description += (
+                f". INTERNET REACHABLE (via load balancer): "
+                + ", ".join(via_lbs)
+            )
+        if not is_reachable:
+            description += ". Not internet-reachable (private subnet, no targeting LB found)"
+
+        # Recommendation
+        recommendation = f"Upgrade {package_name or 'affected package'}"
+        if fixed_in_version:
+            recommendation += f" to {fixed_in_version}"
+        recommendation += "."
+        if is_reachable and exploit_available:
+            reach_detail = ", ".join(direct_ports) if direct_ports else ", ".join(via_lbs)
+            recommendation += (
+                f" URGENT: public exploit exists and instance is internet-reachable"
+                f" ({reach_detail}). Patch immediately."
+            )
+            if direct_ports:
+                recommendation += " Restrict inbound SG rules to trusted IPs."
+            if via_lbs:
+                recommendation += " Review LB target group membership and WAF rules."
+        elif exploit_available:
+            recommendation += " A public exploit exists — prioritise patching."
+        elif is_reachable:
+            if direct_ports:
+                recommendation += (
+                    f" Instance is directly internet-reachable ({', '.join(direct_ports)});"
+                    " restrict inbound rules to trusted IPs while patching."
+                )
+            if via_lbs:
+                recommendation += (
+                    f" Instance receives internet traffic via load balancer(s): {', '.join(via_lbs)}."
+                    " Review WAF rules and patch promptly."
+                )
+
+        check_id = "EC2_V" + cve_id.replace("CVE-", "").replace("-", "_")
+
+        return Finding(
+            check_id=check_id,
+            service="EC2",
+            severity=severity,
+            title=f"{cve_id} in {instance_id}",
+            resource_arn=resource_arn,
+            region=self.region,
+            description=description,
+            recommendation=recommendation,
+            cve_id=cve_id,
+            cvss_score=cvss_score,
+            epss_score=epss_score,
+            exploit_available=exploit_available,
+            fix_available=fix_available,
+            package_name=package_name,
+            package_version=package_version,
+            fixed_in_version=fixed_in_version,
+        )
 
     def _check_vpc_flow_logs(self, ec2, vpcs: list[dict]) -> list[Finding]:
         """EC2_006 - VPC Flow Logs Not Enabled."""
