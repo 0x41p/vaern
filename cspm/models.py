@@ -36,6 +36,9 @@ class Finding:
     package_name: str | None = None
     package_version: str | None = None
     fixed_in_version: str | None = None
+    # Network exposure path (populated by vulnerability scanners only)
+    direct_ports: list[str] | None = None  # ports open to 0.0.0.0/0 on instance SGs
+    via_lbs: list[str] | None = None       # internet-facing LB DNS names routing to resource
 
     def to_dict(self) -> dict:
         d = {
@@ -51,6 +54,7 @@ class Finding:
         for key in (
             "cve_id", "cvss_score", "epss_score", "exploit_available",
             "fix_available", "package_name", "package_version", "fixed_in_version",
+            "direct_ports", "via_lbs",
         ):
             val = getattr(self, key)
             if val is not None:

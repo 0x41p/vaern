@@ -465,4 +465,6 @@ class ECSFargateScanner(BaseScanner):
             package_name=package_name,
             package_version=package_version,
             fixed_in_version=fixed_in_version,
+            direct_ports=direct_ports or None,
+            via_lbs=via_lbs or None,
         )

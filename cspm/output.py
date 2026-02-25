@@ -111,17 +111,98 @@ def print_results(result: ScanResult, no_color: bool = False) -> None:
             )
         console.print(vtable)
 
-    # Detail section for recommendations
+    # Exposure path diagram (only when reachable CVE findings exist)
+    _render_exposure_diagram(console, result.findings)
+
+    # Detail section for recommendations — posture checks only, CVE noise suppressed
     console.print()
     console.print("[bold]Recommendations:[/bold]")
-    seen = set()
+    seen: set[str] = set()
     for f in result.findings:
-        if f.check_id not in seen:
-            seen.add(f.check_id)
+        if f.check_id in seen:
+            continue
+        seen.add(f.check_id)
+        if f.cve_id is not None:
+            continue  # CVE recommendations shown in exposure diagram
+        color = SEVERITY_COLORS[f.severity]
+        console.print(
+            f"  [{color}]{f.check_id}[/{color}] {f.title}: {f.recommendation}"
+        )
+
+
+def _render_exposure_diagram(console: Console, findings: list) -> None:
+    """Print an arrow diagram showing internet → LB/direct → resource → CVEs."""
+    reachable = [
+        f for f in findings
+        if f.cve_id is not None and (f.via_lbs or f.direct_ports)
+    ]
+    if not reachable:
+        return
+
+    # Group by resource so we print each instance/task once
+    by_resource: dict[str, dict] = {}
+    for f in reachable:
+        key = f.resource_arn
+        if key not in by_resource:
+            by_resource[key] = {
+                "short": f.resource_arn.rsplit("/", 1)[-1],
+                "via_lbs": list(f.via_lbs or []),
+                "direct_ports": list(f.direct_ports or []),
+                "cves": [],
+            }
+        # Merge exposure paths in case multiple CVEs on same resource differ
+        for lb in f.via_lbs or []:
+            if lb not in by_resource[key]["via_lbs"]:
+                by_resource[key]["via_lbs"].append(lb)
+        for p in f.direct_ports or []:
+            if p not in by_resource[key]["direct_ports"]:
+                by_resource[key]["direct_ports"].append(p)
+        by_resource[key]["cves"].append(f)
+
+    console.print()
+    console.print("[bold]Internet Exposure Paths:[/bold]")
+    console.print("  " + "─" * 72)
+
+    for data in by_resource.values():
+        short = data["short"]
+
+        # Arrow line(s) — one per exposure vector
+        for lb in data["via_lbs"]:
+            console.print(f"  [bright_cyan]Internet[/bright_cyan] → [yellow]{lb}[/yellow] → [bold]{short}[/bold]")
+        if data["direct_ports"]:
+            ports = ", ".join(data["direct_ports"])
+            console.print(f"  [bright_cyan]Internet[/bright_cyan] ([white]{ports}[/white]) → [bold]{short}[/bold]")
+
+        # CVEs indented under the resource
+        cves = sorted(data["cves"], key=lambda f: (f.severity.value, f.cve_id or ""))
+        for i, f in enumerate(cves):
+            prefix = "  └─" if i == len(cves) - 1 else "  ├─"
             color = SEVERITY_COLORS[f.severity]
-            console.print(
-                f"  [{color}]{f.check_id}[/{color}] {f.title}: {f.recommendation}"
+            cvss = f"CVSS {f.cvss_score:.1f}" if f.cvss_score is not None else ""
+            epss = f"EPSS {f.epss_score:.0%}" if f.epss_score is not None else ""
+            exploit = (
+                "[bold red]exploit YES[/bold red]" if f.exploit_available
+                else "exploit NO" if f.exploit_available is not None
+                else ""
             )
+            pkg = ""
+            if f.package_name:
+                pkg = f.package_name
+                if f.package_version:
+                    pkg += f" {f.package_version}"
+                if f.fixed_in_version:
+                    pkg += f" → {f.fixed_in_version}"
+
+            meta = "  ".join(part for part in [cvss, epss, exploit, pkg] if part)
+            console.print(
+                f"    {prefix} [{color}]{f.cve_id}[/{color}]"
+                f"  [{color}]{f.severity.value}[/{color}]"
+                f"  {meta}"
+            )
+
+        console.print()
+
+    console.print("  " + "─" * 72)
 
 
 def export_json(result: ScanResult, path: str) -> None:
