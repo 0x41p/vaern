@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only show findings at this severity level or above.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Max concurrent scanner threads (default: 10).",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable colored output.",
@@ -87,6 +94,7 @@ def main():
             services=args.services,
             min_severity=args.severity,
             progress_callback=progress,
+            max_workers=args.workers,
         )
     except Exception as e:
         console.print(f"\n[bold red]Scan failed: {e}[/bold red]")
