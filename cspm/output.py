@@ -60,6 +60,57 @@ def print_results(result: ScanResult, no_color: bool = False) -> None:
         )
     console.print(table)
 
+    # Vulnerability table (only when CVE findings exist)
+    vuln_findings = [f for f in result.findings if f.cve_id is not None]
+    if vuln_findings:
+        console.print()
+        vtable = Table(title="Container Vulnerabilities", show_lines=True, expand=True)
+        vtable.add_column("CVE", style="bold", width=18)
+        vtable.add_column("Severity", width=10)
+        vtable.add_column("CVSS", justify="right", width=6)
+        vtable.add_column("EPSS", justify="right", width=8)
+        vtable.add_column("Exploit", width=8)
+        vtable.add_column("Fix", width=6)
+        vtable.add_column("Package", min_width=20)
+        vtable.add_column("Resource", min_width=20)
+
+        for f in vuln_findings:
+            color = SEVERITY_COLORS[f.severity]
+            cvss_str = f"{f.cvss_score:.1f}" if f.cvss_score is not None else "-"
+            epss_str = f"{f.epss_score:.2%}" if f.epss_score is not None else "-"
+
+            if f.exploit_available is None:
+                exploit_str = "-"
+            elif f.exploit_available:
+                exploit_str = "[bold red]YES[/bold red]"
+            else:
+                exploit_str = "NO"
+
+            if f.fix_available is None:
+                fix_str = "-"
+            elif f.fix_available:
+                fix_str = "[bold green]YES[/bold green]"
+            else:
+                fix_str = "NO"
+
+            pkg_str = f.package_name or "-"
+            if f.package_name and f.package_version:
+                pkg_str = f"{f.package_name} {f.package_version}"
+                if f.fixed_in_version:
+                    pkg_str += f" \u2192 {f.fixed_in_version}"
+
+            vtable.add_row(
+                f.cve_id,
+                f"[{color}]{f.severity.value}[/{color}]",
+                cvss_str,
+                epss_str,
+                exploit_str,
+                fix_str,
+                pkg_str,
+                _truncate(f.resource_arn, 40),
+            )
+        console.print(vtable)
+
     # Detail section for recommendations
     console.print()
     console.print("[bold]Recommendations:[/bold]")
