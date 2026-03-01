@@ -12,14 +12,21 @@ SEVERITY_COLORS = {
 }
 
 
-def print_results(result: ScanResult, no_color: bool = False) -> None:
+def print_results(
+    result: ScanResult,
+    no_color: bool = False,
+    acked: list | None = None,
+    show_acked: bool = False,
+) -> None:
     console = Console(no_color=no_color)
+    acked = acked or []
 
     # Header
+    suppressed_line = f"\nSuppressed: {len(acked)}" if acked else ""
     console.print(Panel(
         f"[bold]AWS CSPM Scan Results[/bold]\n"
         f"Account: {result.account_id}  |  Time: {result.scan_time}\n"
-        f"Total findings: {len(result.findings)}",
+        f"Total findings: {len(result.findings)}{suppressed_line}",
         title="cspm",
         border_style="bright_blue",
     ))
@@ -128,6 +135,32 @@ def print_results(result: ScanResult, no_color: bool = False) -> None:
         console.print(
             f"  [{color}]{f.check_id}[/{color}] {f.title}: {f.recommendation}"
         )
+
+    # Acknowledged findings (shown only with --show-acked)
+    if show_acked and acked:
+        console.print()
+        ack_table = Table(
+            title=f"Acknowledged Findings ({len(acked)} suppressed)",
+            show_lines=True,
+            expand=True,
+        )
+        ack_table.add_column("ID", style="dim", width=8)
+        ack_table.add_column("Severity", width=10)
+        ack_table.add_column("Service", width=12)
+        ack_table.add_column("Title", min_width=30)
+        ack_table.add_column("Resource", min_width=20)
+        ack_table.add_column("Region", width=14)
+        for f in acked:
+            color = SEVERITY_COLORS[f.severity]
+            ack_table.add_row(
+                f.check_id,
+                f"[{color}]{f.severity.value}[/{color}]",
+                f.service,
+                f.title,
+                _truncate(f.resource_arn, 50),
+                f.region,
+            )
+        console.print(ack_table)
 
 
 def _render_exposure_diagram(console: Console, findings: list) -> None:

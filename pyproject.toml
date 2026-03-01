@@ -16,5 +16,11 @@ dependencies = [
 [project.scripts]
 cspm = "cspm.cli:main"
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [tool.setuptools.packages.find]
 include = ["cspm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

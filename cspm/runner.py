@@ -1,3 +1,4 @@
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -103,7 +104,7 @@ def run_scan(
                 with findings_lock:
                     result.findings.extend(findings)
             except Exception as e:
-                print(f"  [WARNING] Scanner {label} failed: {e}")
+                print(f"  [WARNING] Scanner {label} failed: {e}", file=sys.stderr)
 
     # Filter by minimum severity
     if min_severity:
