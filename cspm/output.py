@@ -1,8 +1,15 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
 from cspm.models import ScanResult, Severity
+
+if TYPE_CHECKING:
+    from cspm.graph import ToxicCombination
 
 SEVERITY_COLORS = {
     Severity.CRITICAL: "bold red",
@@ -236,6 +243,48 @@ def _render_exposure_diagram(console: Console, findings: list) -> None:
         console.print()
 
     console.print("  " + "─" * 72)
+
+
+def print_graph_results(
+    combos: list[ToxicCombination],
+    no_color: bool = False,
+) -> None:
+    console = Console(no_color=no_color)
+
+    if not combos:
+        console.print(Panel(
+            "[bold green]No toxic combinations found.[/bold green]",
+            title="Security Graph",
+            border_style="bright_blue",
+        ))
+        return
+
+    console.print(Panel(
+        f"[bold]{len(combos)} toxic combination(s) found[/bold]",
+        title="Security Graph",
+        border_style="bright_blue",
+    ))
+
+    for combo in combos:
+        color = SEVERITY_COLORS.get(combo.severity, "white")
+        console.print()
+        console.print(f"  [{color}][{combo.severity.value}][/{color}] {combo.title}")
+        console.print()
+
+        for i, step in enumerate(combo.path):
+            if i == 0:
+                console.print(f"    [bright_cyan]{step}[/bright_cyan]")
+            elif i == len(combo.path) - 1:
+                console.print(f"    └─ {step}")
+            else:
+                console.print(f"    ├─ {step}")
+
+        console.print()
+        console.print(f"  {combo.description}")
+        console.print()
+        console.print(f"  [bold]Fix:[/bold] {combo.recommendation}")
+        console.print()
+        console.print("  " + "─" * 72)
 
 
 def export_json(result: ScanResult, path: str) -> None:

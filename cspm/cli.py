@@ -7,8 +7,9 @@ from rich.console import Console
 from rich.table import Table
 
 from cspm.runner import run_scan
-from cspm.output import print_results, export_json
+from cspm.output import print_results, print_graph_results, export_json
 from cspm.acks import load_acks, save_acks, filter_findings, Ack, DEFAULT_ACK_FILE
+from cspm.graph import SecurityGraph
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +68,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-acked",
         action="store_true",
         help="Also display acknowledged (suppressed) findings at the end.",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Run security graph analysis to detect toxic combinations.",
     )
 
     # Subcommands
@@ -235,6 +241,17 @@ def main():
 
     if args.output_json:
         export_json(result, args.output_json)
+
+    if getattr(args, "graph", False):
+        console.print()
+        console.print("[bold bright_blue]Running security graph analysis...[/bold bright_blue]")
+        try:
+            graph = SecurityGraph(session=session, regions=regions)
+            combos = graph.build()
+        except Exception as e:
+            console.print(f"[bold red]Security graph analysis failed: {e}[/bold red]")
+        else:
+            print_graph_results(combos, no_color=args.no_color)
 
 
 if __name__ == "__main__":
