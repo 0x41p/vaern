@@ -29,6 +29,7 @@ class IAMScanner(BaseScanner):
         findings.extend(self._check_direct_policies(iam))
         findings.extend(self._check_unused_access_keys(cred_report))
         findings.extend(self._check_password_rotation(cred_report))
+        findings.extend(self._check_role_trust_policies(iam))
 
         return findings
 
@@ -249,6 +250,53 @@ class IAMScanner(BaseScanner):
                     ))
             except (ValueError, TypeError):
                 pass
+        return findings
+
+    def _check_role_trust_policies(self, iam) -> list[Finding]:
+        """IAM_008 - IAM Role with Public Trust Policy (assumable by anyone)."""
+        findings: list[Finding] = []
+        paginator = iam.get_paginator("list_roles")
+        for page in paginator.paginate():
+            for role in page.get("Roles", []):
+                role_arn = role.get("Arn", "")
+                role_name = role.get("RoleName", "")
+                trust_policy = role.get("AssumeRolePolicyDocument", {})
+
+                for stmt in trust_policy.get("Statement", []):
+                    if stmt.get("Effect") != "Allow":
+                        continue
+                    if "Condition" in stmt:
+                        continue  # conditions (e.g. ExternalId) narrow the scope
+                    principal = stmt.get("Principal", {})
+                    aws_principal = (
+                        principal if isinstance(principal, str)
+                        else principal.get("AWS", "")
+                    )
+                    is_public = (
+                        aws_principal == "*"
+                        or (isinstance(aws_principal, list) and "*" in aws_principal)
+                    )
+                    if is_public:
+                        findings.append(Finding(
+                            check_id="IAM_008",
+                            service="IAM",
+                            severity=Severity.CRITICAL,
+                            title="IAM Role Has a Public Trust Policy",
+                            resource_arn=role_arn,
+                            region="global",
+                            description=(
+                                f"IAM role '{role_name}' has a trust policy that allows any "
+                                f"AWS principal (Principal: \"*\") to assume it without conditions. "
+                                f"Any authenticated entity across all AWS accounts can assume this role "
+                                f"and inherit its permissions."
+                            ),
+                            recommendation=(
+                                "Restrict the trust policy to specific account IDs, roles, or services. "
+                                "If cross-account access is required, use aws:PrincipalOrgID or "
+                                "an ExternalId condition to limit who can assume the role."
+                            ),
+                        ))
+                        break  # one finding per role
         return findings
 
     def _get_recent_password_changes(self) -> set[str]:

@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--services",
         nargs="+",
         default=None,
-        help="Specific services to scan (e.g. S3 IAM EC2 RDS CloudTrail EBS Lambda ECS ECR ECSFargate). Default: all.",
+        help="Specific services to scan (e.g. S3 IAM EC2 RDS CloudTrail EBS Lambda ECS ECR ECSFargate KMS SecurityServices). Default: all.",
     )
     parser.add_argument(
         "--regions",
@@ -239,9 +239,7 @@ def main():
     console.print()
     print_results(result, no_color=args.no_color, acked=acked, show_acked=args.show_acked)
 
-    if args.output_json:
-        export_json(result, args.output_json)
-
+    combos = []
     if getattr(args, "graph", False):
         console.print()
         console.print("[bold bright_blue]Running security graph analysis...[/bold bright_blue]")
@@ -252,6 +250,9 @@ def main():
             console.print(f"[bold red]Security graph analysis failed: {e}[/bold red]")
         else:
             print_graph_results(combos, no_color=args.no_color)
+
+    if args.output_json:
+        export_json(result, args.output_json, combos=combos or None)
 
 
 if __name__ == "__main__":
