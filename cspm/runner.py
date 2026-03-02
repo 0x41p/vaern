@@ -22,6 +22,7 @@ import cspm.scanners.ecr  # noqa: F401
 import cspm.scanners.ecs_fargate  # noqa: F401
 import cspm.scanners.kms  # noqa: F401
 import cspm.scanners.security_services  # noqa: F401
+import cspm.scanners.apigw  # noqa: F401
 
 GLOBAL_SERVICES = {"IAM"}
 

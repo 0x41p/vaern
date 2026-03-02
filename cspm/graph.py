@@ -15,6 +15,7 @@ from botocore.exceptions import ClientError
 
 from cspm.models import Severity
 from cspm.scanners import RETRY_CONFIG
+from cspm.reachability import build_route_table_data, is_subnet_internet_routable
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ class SecurityGraph:
         try:
             ec2 = self._session.client("ec2", region_name=region, config=RETRY_CONFIG)
 
+            subnet_to_rt, vpc_main_rt, rt_has_igw = build_route_table_data(ec2)
+
             instances: list[dict] = []
             paginator = ec2.get_paginator("describe_instances")
             for page in paginator.paginate(
@@ -90,7 +93,15 @@ class SecurityGraph:
             ):
                 for res in page.get("Reservations", []):
                     for inst in res.get("Instances", []):
-                        if inst.get("PublicIpAddress") and inst.get("IamInstanceProfile"):
+                        if (
+                            inst.get("PublicIpAddress")
+                            and inst.get("IamInstanceProfile")
+                            and is_subnet_internet_routable(
+                                inst.get("SubnetId", ""),
+                                inst.get("VpcId", ""),
+                                subnet_to_rt, vpc_main_rt, rt_has_igw,
+                            )
+                        ):
                             instances.append(inst)
 
             if not instances:
