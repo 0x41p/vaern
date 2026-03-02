@@ -54,6 +54,7 @@ def print_results(
         return
 
     # Findings table
+    has_frameworks = any(f.frameworks for f in result.findings)
     table = Table(title="Findings", show_lines=True, expand=True)
     table.add_column("ID", style="dim", width=8)
     table.add_column("Severity", width=10)
@@ -61,17 +62,23 @@ def print_results(
     table.add_column("Title", min_width=30)
     table.add_column("Resource", min_width=20)
     table.add_column("Region", width=14)
+    if has_frameworks:
+        table.add_column("Frameworks", style="dim", min_width=18)
 
     for f in result.findings:
         color = SEVERITY_COLORS[f.severity]
-        table.add_row(
+        fw_str = " · ".join(f.frameworks) if f.frameworks else ""
+        row = [
             f.check_id,
             f"[{color}]{f.severity.value}[/{color}]",
             f.service,
             f.title,
             _truncate(f.resource_arn, 50),
             f.region,
-        )
+        ]
+        if has_frameworks:
+            row.append(fw_str)
+        table.add_row(*row)
     console.print(table)
 
     # Vulnerability table (only when CVE findings exist)
@@ -139,8 +146,11 @@ def print_results(
         if f.cve_id is not None:
             continue  # CVE recommendations shown in exposure diagram
         color = SEVERITY_COLORS[f.severity]
+        fw_tag = (
+            f"  [dim]{' · '.join(f.frameworks)}[/dim]" if f.frameworks else ""
+        )
         console.print(
-            f"  [{color}]{f.check_id}[/{color}] {f.title}: {f.recommendation}"
+            f"  [{color}]{f.check_id}[/{color}]{fw_tag} {f.title}: {f.recommendation}"
         )
 
     # Acknowledged findings (shown only with --show-acked)

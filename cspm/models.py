@@ -39,6 +39,8 @@ class Finding:
     # Network exposure path (populated by vulnerability scanners only)
     direct_ports: list[str] | None = None  # ports open to 0.0.0.0/0 on instance SGs
     via_lbs: list[str] | None = None       # internet-facing LB DNS names routing to resource
+    # Compliance framework references e.g. ["CIS 1.5", "FSBP IAM.6"]
+    frameworks: list[str] | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -54,7 +56,7 @@ class Finding:
         for key in (
             "cve_id", "cvss_score", "epss_score", "exploit_available",
             "fix_available", "package_name", "package_version", "fixed_in_version",
-            "direct_ports", "via_lbs",
+            "direct_ports", "via_lbs", "frameworks",
         ):
             val = getattr(self, key)
             if val is not None:
