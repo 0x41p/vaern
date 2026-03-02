@@ -4,6 +4,7 @@ from botocore.exceptions import ClientError
 
 from cspm.models import Finding, Severity
 from cspm.scanners import BaseScanner, register_scanner
+from cspm.reachability import build_route_table_data, is_subnet_internet_routable
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ class EC2Scanner(BaseScanner):
         vpcs = self._describe_all_vpcs(ec2)
         instances = self._describe_all_instances(ec2)
 
+        # Route table data: used to validate whether instances with public IPs
+        # actually have a path to an Internet Gateway before flagging them.
+        subnet_to_rt, vpc_main_rt, rt_has_igw = build_route_table_data(ec2)
+
         # Track SG IDs that have wide-open findings (used by EC2_005)
         wide_open_sg_ids: set[str] = set()
 
@@ -57,15 +62,19 @@ class EC2Scanner(BaseScanner):
 
             findings.extend(sg_findings)
 
-        findings.extend(self._check_public_ip_wide_open_sg(ec2, instances, wide_open_sg_ids))
+        findings.extend(self._check_public_ip_wide_open_sg(
+            ec2, instances, wide_open_sg_ids, subnet_to_rt, vpc_main_rt, rt_has_igw,
+        ))
         findings.extend(self._check_vpc_flow_logs(ec2, vpcs))
-        findings.extend(self._check_imdsv2(instances))
+        findings.extend(self._check_imdsv2(instances, subnet_to_rt, vpc_main_rt, rt_has_igw))
         findings.extend(self._check_default_vpc_in_use(vpcs, instances))
         findings.extend(self._check_unrestricted_egress(security_groups))
 
         # Vulnerability scanning — reuse already-fetched SG and instance data
         sg_exposure = self._build_sg_exposure_map(security_groups)
-        instance_network = self._build_instance_network_map(instances)
+        instance_network = self._build_instance_network_map(
+            instances, subnet_to_rt, vpc_main_rt, rt_has_igw,
+        )
         ip_to_instance = self._build_ip_to_instance_map(instances)
         lb_instance_map = self._build_lb_instance_map(ip_to_instance)
         findings.extend(self._scan_ec2_vulnerabilities(sg_exposure, instance_network, lb_instance_map))
@@ -240,13 +249,28 @@ class EC2Scanner(BaseScanner):
         return []
 
     def _check_public_ip_wide_open_sg(
-        self, ec2, instances: list[dict], wide_open_sg_ids: set[str]
+        self,
+        ec2,
+        instances: list[dict],
+        wide_open_sg_ids: set[str],
+        subnet_to_rt: dict[str, str],
+        vpc_main_rt: dict[str, str],
+        rt_has_igw: dict[str, bool],
     ) -> list[Finding]:
         """EC2_005 - EC2 Instance Has Public IP and Wide-Open SG."""
         findings: list[Finding] = []
         for instance in instances:
             public_ip = instance.get("PublicIpAddress")
             if not public_ip:
+                continue
+
+            # Skip instances whose subnet has no IGW route — they have a public
+            # IP assigned but are not actually internet-reachable.
+            if not is_subnet_internet_routable(
+                instance.get("SubnetId", ""),
+                instance.get("VpcId", ""),
+                subnet_to_rt, vpc_main_rt, rt_has_igw,
+            ):
                 continue
 
             instance_sg_ids = {
@@ -324,14 +348,25 @@ class EC2Scanner(BaseScanner):
         return exposure
 
     def _build_instance_network_map(
-        self, instances: list[dict]
+        self,
+        instances: list[dict],
+        subnet_to_rt: dict[str, str],
+        vpc_main_rt: dict[str, str],
+        rt_has_igw: dict[str, bool],
     ) -> dict[str, dict]:
-        """Map instance ID → {sg_ids, public_ip}."""
+        """Map instance ID → {sg_ids, public_ip, igw_routable}."""
         network: dict[str, dict] = {}
         for instance in instances:
+            public_ip = instance.get("PublicIpAddress")
+            igw_routable = bool(public_ip) and is_subnet_internet_routable(
+                instance.get("SubnetId", ""),
+                instance.get("VpcId", ""),
+                subnet_to_rt, vpc_main_rt, rt_has_igw,
+            )
             network[instance["InstanceId"]] = {
                 "sg_ids": {g["GroupId"] for g in instance.get("SecurityGroups", [])},
-                "public_ip": instance.get("PublicIpAddress"),
+                "public_ip": public_ip,
+                "igw_routable": igw_routable,
             }
         return network
 
@@ -438,7 +473,7 @@ class EC2Scanner(BaseScanner):
         via_lbs: list[str] = lb_instance_map.get(instance_id, [])
 
         net = instance_network.get(instance_id)
-        if net and net["public_ip"]:
+        if net and net.get("igw_routable"):
             exposed: list[str] = []
             for sg_id in net["sg_ids"]:
                 exposed.extend(sg_exposure.get(sg_id, []))
@@ -613,7 +648,13 @@ class EC2Scanner(BaseScanner):
             via_lbs=via_lbs or None,
         )
 
-    def _check_imdsv2(self, instances: list[dict]) -> list[Finding]:
+    def _check_imdsv2(
+        self,
+        instances: list[dict],
+        subnet_to_rt: dict[str, str],
+        vpc_main_rt: dict[str, str],
+        rt_has_igw: dict[str, bool],
+    ) -> list[Finding]:
         """EC2_007 - EC2 Instance Does Not Enforce IMDSv2."""
         findings: list[Finding] = []
         for instance in instances:
@@ -625,7 +666,12 @@ class EC2Scanner(BaseScanner):
 
             instance_id = instance["InstanceId"]
             public_ip = instance.get("PublicIpAddress")
-            severity = Severity.HIGH if public_ip else Severity.MEDIUM
+            internet_routable = public_ip and is_subnet_internet_routable(
+                instance.get("SubnetId", ""),
+                instance.get("VpcId", ""),
+                subnet_to_rt, vpc_main_rt, rt_has_igw,
+            )
+            severity = Severity.HIGH if internet_routable else Severity.MEDIUM
             owner_id = instance.get("OwnerId", "unknown")
             instance_arn = f"arn:aws:ec2:{self.region}:{owner_id}:instance/{instance_id}"
             current = metadata_opts.get("HttpTokens", "optional")
