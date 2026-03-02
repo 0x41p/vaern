@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run security graph analysis to detect toxic combinations.",
     )
+    parser.add_argument(
+        "--framework",
+        metavar="NAME",
+        default=None,
+        help="Only show findings mapped to this framework (e.g. CIS, FSBP, or a specific control like 'CIS 1.5').",
+    )
 
     # Subcommands
     subparsers = parser.add_subparsers(dest="command")
@@ -235,6 +241,13 @@ def main():
 
     active, acked = filter_findings(result.findings, acks)
     result.findings = active
+
+    if getattr(args, "framework", None):
+        prefix = args.framework.upper()
+        result.findings = [
+            f for f in result.findings
+            if f.frameworks and any(fw.upper().startswith(prefix) for fw in f.frameworks)
+        ]
 
     console.print()
     print_results(result, no_color=args.no_color, acked=acked, show_acked=args.show_acked)

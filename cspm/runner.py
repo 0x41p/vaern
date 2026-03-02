@@ -7,6 +7,7 @@ import boto3
 
 from cspm.models import ScanResult, Severity, SEVERITY_ORDER
 from cspm.scanners import SCANNER_REGISTRY
+from cspm.frameworks import FRAMEWORK_MAP
 
 # Force-import all scanner modules so @register_scanner decorators execute
 import cspm.scanners.s3  # noqa: F401
@@ -107,6 +108,12 @@ def run_scan(
                     result.findings.extend(findings)
             except Exception as e:
                 print(f"  [WARNING] Scanner {label} failed: {e}", file=sys.stderr)
+
+    # Enrich findings with compliance framework references
+    for finding in result.findings:
+        mapped = FRAMEWORK_MAP.get(finding.check_id)
+        if mapped and finding.frameworks is None:
+            finding.frameworks = mapped
 
     # Filter by minimum severity
     if min_severity:
