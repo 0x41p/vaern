@@ -287,9 +287,29 @@ def print_graph_results(
         console.print("  " + "─" * 72)
 
 
-def export_json(result: ScanResult, path: str) -> None:
+def export_json(
+    result: ScanResult,
+    path: str,
+    combos: list[ToxicCombination] | None = None,
+) -> None:
+    import json as _json
+    data = _json.loads(result.to_json())
+    if combos:
+        data["toxic_combinations"] = [
+            {
+                "id": c.id,
+                "title": c.title,
+                "severity": c.severity.value,
+                "description": c.description,
+                "recommendation": c.recommendation,
+                "path": c.path,
+                "resource_arn": c.resource_arn,
+                "region": c.region,
+            }
+            for c in combos
+        ]
     with open(path, "w") as fh:
-        fh.write(result.to_json())
+        _json.dump(data, fh, indent=2)
     Console().print(f"\n[bold green]JSON report written to {path}[/bold green]")
 
 

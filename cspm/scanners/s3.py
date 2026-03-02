@@ -1,7 +1,11 @@
+import logging
+
 from botocore.exceptions import ClientError
 
 from cspm.models import Finding, Severity
 from cspm.scanners import BaseScanner, register_scanner
+
+logger = logging.getLogger(__name__)
 
 
 @register_scanner
@@ -28,6 +32,8 @@ class S3Scanner(BaseScanner):
             findings.extend(self._check_versioning(regional_s3, name, region))
             findings.extend(self._check_logging(regional_s3, name, region))
             findings.extend(self._check_policy_public(regional_s3, name, region))
+            findings.extend(self._check_cors(regional_s3, name, region))
+            findings.extend(self._check_mfa_delete(regional_s3, name, region))
 
         return findings
 
@@ -158,6 +164,71 @@ class S3Scanner(BaseScanner):
                 region=region,
                 description=f"Bucket '{bucket_name}' does not have server access logging enabled.",
                 recommendation="Enable server access logging to track requests to this bucket.",
+            )]
+        return []
+
+    def _check_cors(self, s3, bucket_name: str, region: str) -> list[Finding]:
+        """S3_007 - S3 Bucket Has Overly Permissive CORS Policy."""
+        try:
+            resp = s3.get_bucket_cors(Bucket=bucket_name)
+            for rule in resp.get("CORSRules", []):
+                origins = rule.get("AllowedOrigins", [])
+                if "*" not in origins:
+                    continue
+                methods = rule.get("AllowedMethods", [])
+                has_writes = any(m in ("PUT", "DELETE", "POST") for m in methods)
+                severity = Severity.HIGH if has_writes else Severity.MEDIUM
+                methods_str = ", ".join(methods)
+                return [Finding(
+                    check_id="S3_007",
+                    service="S3",
+                    severity=severity,
+                    title="S3 Bucket Has Overly Permissive CORS Policy",
+                    resource_arn=f"arn:aws:s3:::{bucket_name}",
+                    region=region,
+                    description=(
+                        f"Bucket '{bucket_name}' has a CORS rule allowing requests from any origin "
+                        f"(AllowedOrigins: [\"*\"]) with methods: {methods_str}. "
+                        + (
+                            "Write methods (PUT/POST/DELETE) combined with wildcard origin can enable "
+                            "cross-site request forgery (CSRF) against this bucket."
+                            if has_writes else
+                            "Any website can read data from this bucket via the browser."
+                        )
+                    ),
+                    recommendation=(
+                        "Restrict AllowedOrigins to the specific domains that legitimately need access. "
+                        "Never combine AllowedOrigins: [\"*\"] with write methods."
+                    ),
+                )]
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchCORSConfiguration":
+                logger.warning("get_bucket_cors failed for %s: %s", bucket_name, e)
+        return []
+
+    def _check_mfa_delete(self, s3, bucket_name: str, region: str) -> list[Finding]:
+        """S3_008 - S3 Bucket Versioning Enabled Without MFA Delete."""
+        resp = s3.get_bucket_versioning(Bucket=bucket_name)
+        if resp.get("Status") != "Enabled":
+            return []  # versioning not on — MFA Delete not applicable
+        if resp.get("MFADelete") != "Enabled":
+            return [Finding(
+                check_id="S3_008",
+                service="S3",
+                severity=Severity.MEDIUM,
+                title="S3 Bucket MFA Delete Not Enabled",
+                resource_arn=f"arn:aws:s3:::{bucket_name}",
+                region=region,
+                description=(
+                    f"Bucket '{bucket_name}' has versioning enabled but MFA Delete is disabled. "
+                    f"Without MFA Delete, a compromised IAM credential with s3:DeleteObjectVersion "
+                    f"can permanently destroy all object versions, defeating the ransomware protection "
+                    f"that versioning is meant to provide."
+                ),
+                recommendation=(
+                    "Enable MFA Delete using root account credentials and an MFA device. "
+                    "This requires a second factor for any operation that permanently deletes object versions."
+                ),
             )]
         return []
 

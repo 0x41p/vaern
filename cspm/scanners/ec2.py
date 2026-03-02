@@ -59,6 +59,9 @@ class EC2Scanner(BaseScanner):
 
         findings.extend(self._check_public_ip_wide_open_sg(ec2, instances, wide_open_sg_ids))
         findings.extend(self._check_vpc_flow_logs(ec2, vpcs))
+        findings.extend(self._check_imdsv2(instances))
+        findings.extend(self._check_default_vpc_in_use(vpcs, instances))
+        findings.extend(self._check_unrestricted_egress(security_groups))
 
         # Vulnerability scanning — reuse already-fetched SG and instance data
         sg_exposure = self._build_sg_exposure_map(security_groups)
@@ -609,6 +612,116 @@ class EC2Scanner(BaseScanner):
             direct_ports=direct_ports or None,
             via_lbs=via_lbs or None,
         )
+
+    def _check_imdsv2(self, instances: list[dict]) -> list[Finding]:
+        """EC2_007 - EC2 Instance Does Not Enforce IMDSv2."""
+        findings: list[Finding] = []
+        for instance in instances:
+            if instance.get("State", {}).get("Name") not in ("running", "stopped"):
+                continue
+            metadata_opts = instance.get("MetadataOptions", {})
+            if metadata_opts.get("HttpTokens") == "required":
+                continue
+
+            instance_id = instance["InstanceId"]
+            public_ip = instance.get("PublicIpAddress")
+            severity = Severity.HIGH if public_ip else Severity.MEDIUM
+            owner_id = instance.get("OwnerId", "unknown")
+            instance_arn = f"arn:aws:ec2:{self.region}:{owner_id}:instance/{instance_id}"
+            current = metadata_opts.get("HttpTokens", "optional")
+
+            findings.append(Finding(
+                check_id="EC2_007",
+                service="EC2",
+                severity=severity,
+                title="EC2 Instance Does Not Enforce IMDSv2",
+                resource_arn=instance_arn,
+                region=self.region,
+                description=(
+                    f"EC2 instance '{instance_id}' allows IMDSv1 "
+                    f"(MetadataOptions.HttpTokens = '{current}'). "
+                    f"IMDSv1 is vulnerable to SSRF attacks: a compromised application can "
+                    f"silently request http://169.254.169.254/latest/meta-data/iam/security-credentials/ "
+                    f"and retrieve the instance role credentials with no token required."
+                    + (
+                        f" This instance also has a public IP ({public_ip})."
+                        if public_ip else ""
+                    )
+                ),
+                recommendation=(
+                    "Set MetadataOptions.HttpTokens to 'required' on the instance or in the "
+                    "launch template to enforce IMDSv2. Update any applications using the "
+                    "metadata service to include the IMDSv2 session token header."
+                ),
+            ))
+        return findings
+
+    def _check_default_vpc_in_use(
+        self, vpcs: list[dict], instances: list[dict]
+    ) -> list[Finding]:
+        """EC2_008 - Default VPC Has Running Instances."""
+        default_vpc_ids = {v["VpcId"] for v in vpcs if v.get("IsDefault", False)}
+        if not default_vpc_ids:
+            return []
+
+        counts: dict[str, int] = {}
+        for instance in instances:
+            if instance.get("State", {}).get("Name") not in ("running", "stopped"):
+                continue
+            vpc_id = instance.get("VpcId", "")
+            if vpc_id in default_vpc_ids:
+                counts[vpc_id] = counts.get(vpc_id, 0) + 1
+
+        findings: list[Finding] = []
+        for vpc_id, count in counts.items():
+            findings.append(Finding(
+                check_id="EC2_008",
+                service="EC2",
+                severity=Severity.MEDIUM,
+                title="Default VPC Is In Use",
+                resource_arn=vpc_id,
+                region=self.region,
+                description=(
+                    f"The default VPC '{vpc_id}' in {self.region} has {count} instance(s) "
+                    f"running in it. The default VPC is not designed for production: its subnets "
+                    f"auto-assign public IPs, its default security group allows all intra-SG traffic, "
+                    f"and it has no network segmentation."
+                ),
+                recommendation=(
+                    "Migrate resources to a custom VPC with private subnets, explicit routing, "
+                    "and a hardened security group baseline. Delete the default VPC once empty."
+                ),
+            ))
+        return findings
+
+    def _check_unrestricted_egress(self, security_groups: list[dict]) -> list[Finding]:
+        """EC2_009 - Security Group Allows All Outbound Traffic."""
+        findings: list[Finding] = []
+        for sg in security_groups:
+            if sg.get("GroupName") == "default":
+                continue  # already covered by EC2_004
+            sg_id = sg["GroupId"]
+            for rule in sg.get("IpPermissionsEgress", []):
+                if self._rule_is_all_traffic_open(rule):
+                    findings.append(Finding(
+                        check_id="EC2_009",
+                        service="EC2",
+                        severity=Severity.MEDIUM,
+                        title="Security Group Allows Unrestricted Outbound Traffic",
+                        resource_arn=sg_id,
+                        region=self.region,
+                        description=(
+                            f"Security group '{sg_id}' allows all outbound traffic "
+                            f"(all ports, all protocols) to 0.0.0.0/0 or ::/0. "
+                            f"This enables data exfiltration and C2 callbacks from a compromised instance."
+                        ),
+                        recommendation=(
+                            "Restrict outbound rules to only the ports and destinations your workload "
+                            "requires — for example, TCP 443 to specific endpoints or CIDR ranges."
+                        ),
+                    ))
+                    break  # one finding per SG is enough
+        return findings
 
     def _check_vpc_flow_logs(self, ec2, vpcs: list[dict]) -> list[Finding]:
         """EC2_006 - VPC Flow Logs Not Enabled."""
